@@ -26,12 +26,14 @@ run_wrangler deployments status "${WARGS[@]}" | tee "$OUT/deployments-status.txt
 VERSION_ID=""
 if command -v jq >/dev/null 2>&1; then
   VERSION_ID="$(jq -r '
-    (if type == "array" then .[0] else . end) as $d
-    | ($d.versions[0].version_id // $d.version_id // $d.id // empty)
+    (if type == "array" then . else [.] end)
+    | sort_by(.created_on)
+    | last
+    | .versions[0].version_id // .version_id // empty
   ' "$OUT/deployments.json" 2>/dev/null || true)"
 fi
 if [ -z "$VERSION_ID" ] || [ "$VERSION_ID" = "null" ]; then
-  VERSION_ID="$(run_wrangler deployments list "${WARGS[@]}" | awk '/Version ID|version_id/ {print $NF; exit}')"
+  VERSION_ID="$(awk '/Version\\(s\\):/ {print $NF; exit}' "$OUT/deployments-status.txt")"
 fi
 
 echo "== current version id: ${VERSION_ID:-unknown} =="
@@ -93,8 +95,10 @@ d1 responses-from-oct-ids \
    ORDER BY submitted_at"
 
 echo "== wrangler tail ~16 minutes (one cron interval); best-effort =="
+# env.production sets Worker name to "checkin". Passing --env production makes
+# wrangler 3.x look for checkin-production, which does not exist (API 10007).
 set +e
-timeout 960 npx wrangler tail checkin "${WARGS[@]}" --format json > "$OUT/tail.jsonl"
+timeout 960 npx wrangler tail checkin --name checkin --format json > "$OUT/tail.jsonl"
 TAIL_STATUS=$?
 set -e
 echo "tail_exit=$TAIL_STATUS" | tee "$OUT/tail-status.txt"
