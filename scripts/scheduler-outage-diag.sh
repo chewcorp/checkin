@@ -95,10 +95,10 @@ d1 responses-from-oct-ids \
    ORDER BY submitted_at"
 
 echo "== wrangler tail ~16 minutes (one cron interval); best-effort =="
-# env.production sets Worker name to "checkin". Passing --env production makes
-# wrangler 3.x look for checkin-production, which does not exist (API 10007).
+# Do not pass --env production: wrangler 3.x then requests checkin-production
+# (API 10007). The production Worker name is checkin.
 set +e
-timeout 960 npx wrangler tail checkin --name checkin --format json > "$OUT/tail.jsonl"
+timeout 960 npx wrangler tail checkin --format json > "$OUT/tail.jsonl"
 TAIL_STATUS=$?
 set -e
 echo "tail_exit=$TAIL_STATUS" | tee "$OUT/tail-status.txt"
