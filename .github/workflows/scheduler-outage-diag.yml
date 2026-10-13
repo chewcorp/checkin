@@ -1,0 +1,45 @@
+# Read-only production diagnostics for the Oct 2026 scheduler gap.
+# Do not merge to main. No deploy step. No D1/KV/var writes.
+#
+# workflow_dispatch-only from the GitHub UI requires the file on default
+# branch; this branch also runs on push to itself so the dump can be
+# triggered without merging (same pattern as the one-shot G1 dump).
+name: Scheduler outage diag
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cursor/scheduler-outage-diag-c1aa
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Configure production D1 binding
+        run: |
+          if [ -z "${{ vars.CLOUDFLARE_D1_DATABASE_ID }}" ]; then
+            echo "CLOUDFLARE_D1_DATABASE_ID repository variable is required" >&2
+            exit 1
+          fi
+          sed -i "s/__CLOUDFLARE_D1_DATABASE_ID__/${{ vars.CLOUDFLARE_D1_DATABASE_ID }}/g" wrangler.toml
+      - name: Read-only wrangler dump (no deploy, no writes)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bash scripts/scheduler-outage-diag.sh
+      - name: Upload diag artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-outage-diag
+          path: /tmp/scheduler-outage-diag
+          if-no-files-found: warn
