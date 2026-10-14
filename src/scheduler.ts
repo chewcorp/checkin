@@ -28,6 +28,9 @@ export interface SchedulerEnv {
   PUSHOVER_USER?: string;
 }
 
+/** Matches wrangler.toml production cron: every 15 minutes. */
+export const CRON_PERIOD_MINUTES = 15;
+
 export function pickTargetMinutes(window: ScheduleWindow, dateKey: string): number {
   const span = Math.max(window.endMinutes - window.startMinutes, 1);
   const input = `${dateKey}:${window.index}`;
@@ -42,6 +45,110 @@ export function isWithinPromptDay(minutesOfDay: number): boolean {
   const start = parseClock(PROMPT_DAY_START);
   const end = parseClock(PROMPT_DAY_END);
   return minutesOfDay >= start && minutesOfDay < end;
+}
+
+/**
+ * Exclusive window end + a 15-minute cron means any target in the last
+ * cron period is unreachable unless this tick still sends. `now + period`
+ * landing at or past `endMinutes` is the last in-window opportunity.
+ */
+export function isLastWindowOpportunity(
+  minutesOfDay: number,
+  window: ScheduleWindow,
+  cronPeriodMinutes = CRON_PERIOD_MINUTES,
+): boolean {
+  return minutesOfDay + cronPeriodMinutes >= window.endMinutes;
+}
+
+/** A matching window ready to send on this tick. `lastOpportunity` marks an early send via the last-tick fallback (now still before the hashed target). */
+export interface DueWindow {
+  window: ScheduleWindow;
+  targetMinutes: number;
+  lastOpportunity: boolean;
+}
+
+export type SchedulerTimeDecision =
+  | { action: "outside_active_hours"; dateKey: string; minutesOfDay: number }
+  | { action: "no_matching_window"; dateKey: string; minutesOfDay: number }
+  | {
+      action: "before_target";
+      dateKey: string;
+      minutesOfDay: number;
+      window: ScheduleWindow;
+      targetMinutes: number;
+    }
+  | {
+      action: "due";
+      dateKey: string;
+      minutesOfDay: number;
+      due: DueWindow[];
+    };
+
+export function decideSchedulerTick(
+  now: Date,
+  scheduleWindows: string,
+  cronPeriodMinutes = CRON_PERIOD_MINUTES,
+): SchedulerTimeDecision {
+  const london = getLondonParts(now);
+  if (!isWithinPromptDay(london.minutesOfDay)) {
+    return {
+      action: "outside_active_hours",
+      dateKey: london.dateKey,
+      minutesOfDay: london.minutesOfDay,
+    };
+  }
+
+  // Overlapping windows each need their own decision: an early-return here
+  // would let one window's `before_target` hide a later window that is due.
+  const due: DueWindow[] = [];
+  let firstBeforeTarget: {
+    window: ScheduleWindow;
+    targetMinutes: number;
+  } | null = null;
+
+  for (const window of parseWindows(scheduleWindows)) {
+    if (
+      london.minutesOfDay < window.startMinutes ||
+      london.minutesOfDay >= window.endMinutes
+    ) {
+      continue;
+    }
+
+    const targetMinutes = pickTargetMinutes(window, london.dateKey);
+    if (london.minutesOfDay < targetMinutes) {
+      if (!isLastWindowOpportunity(london.minutesOfDay, window, cronPeriodMinutes)) {
+        firstBeforeTarget ??= { window, targetMinutes };
+        continue;
+      }
+      due.push({ window, targetMinutes, lastOpportunity: true });
+      continue;
+    }
+
+    due.push({ window, targetMinutes, lastOpportunity: false });
+  }
+
+  if (due.length > 0) {
+    return {
+      action: "due",
+      dateKey: london.dateKey,
+      minutesOfDay: london.minutesOfDay,
+      due,
+    };
+  }
+  if (firstBeforeTarget) {
+    return {
+      action: "before_target",
+      dateKey: london.dateKey,
+      minutesOfDay: london.minutesOfDay,
+      window: firstBeforeTarget.window,
+      targetMinutes: firstBeforeTarget.targetMinutes,
+    };
+  }
+  return {
+    action: "no_matching_window",
+    dateKey: london.dateKey,
+    minutesOfDay: london.minutesOfDay,
+  };
 }
 
 async function sendPrompt(
@@ -80,27 +187,48 @@ export async function runScheduler(
     log("info", "prompts_expired", { count: expired });
   }
 
-  const london = getLondonParts(now);
-  if (!isWithinPromptDay(london.minutesOfDay)) {
+  const decision = decideSchedulerTick(now, env.SCHEDULE_WINDOWS ?? DEFAULT_WINDOWS);
+  if (decision.action === "outside_active_hours") {
     log("info", "scheduler_skipped", { reason: "outside_active_hours" });
     return;
   }
+  if (decision.action === "no_matching_window") {
+    log("info", "scheduler_skipped", {
+      reason: "no_matching_window",
+      date_key: decision.dateKey,
+      minutes_of_day: decision.minutesOfDay,
+    });
+    return;
+  }
+  if (decision.action === "before_target") {
+    log("info", "scheduler_skipped", {
+      reason: "before_target",
+      date_key: decision.dateKey,
+      window: decision.window.index,
+      minutes_of_day: decision.minutesOfDay,
+      target_minutes: decision.targetMinutes,
+    });
+    return;
+  }
 
-  const windows = parseWindows(env.SCHEDULE_WINDOWS ?? DEFAULT_WINDOWS);
-
-  for (const window of windows) {
-    if (london.minutesOfDay < window.startMinutes || london.minutesOfDay >= window.endMinutes) {
-      continue;
+  for (const dueWindow of decision.due) {
+    if (dueWindow.lastOpportunity) {
+      log("info", "scheduler_last_opportunity", {
+        date_key: decision.dateKey,
+        window: dueWindow.window.index,
+        minutes_of_day: decision.minutesOfDay,
+        target_minutes: dueWindow.targetMinutes,
+      });
     }
 
-    const targetMinutes = pickTargetMinutes(window, london.dateKey);
-    if (london.minutesOfDay < targetMinutes) {
-      continue;
-    }
-
-    const id = promptId(london.dateKey, window.index);
+    const id = promptId(decision.dateKey, dueWindow.window.index);
     const existing = await getPromptById(env.DB, id);
     if (existing && existing.status !== "scheduled") {
+      log("info", "scheduler_skipped", {
+        reason: "already_final",
+        prompt_id: id,
+        status: existing.status,
+      });
       continue;
     }
 
@@ -109,7 +237,17 @@ export async function runScheduler(
       continue;
     }
 
-    const scheduledFor = londonInstant(london.dateKey, targetMinutes, now).toISOString();
+    // A last-opportunity send fires before the hashed target; keep
+    // scheduled_for at or before sent_at so exports and the drift check
+    // keep schedule-then-delivery order (docs/g1-gate-report.md).
+    const targetInstant = londonInstant(
+      decision.dateKey,
+      dueWindow.targetMinutes,
+      now,
+    );
+    const scheduledFor = new Date(
+      Math.min(targetInstant.getTime(), now.getTime()),
+    ).toISOString();
     const row: PromptRow = {
       id,
       scheduled_for: scheduledFor,
@@ -123,6 +261,10 @@ export async function runScheduler(
 
     const inserted = await insertPrompt(env.DB, row);
     if (!inserted) {
+      log("info", "scheduler_skipped", {
+        reason: "insert_conflict",
+        prompt_id: id,
+      });
       continue;
     }
 
