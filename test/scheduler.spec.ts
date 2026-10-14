@@ -99,8 +99,51 @@ describe("scheduler tick decisions (Oct 2026 dead zone)", () => {
         action: tick.action,
       });
       if (decision.action === "due") {
-        expect(decision.lastOpportunity).toBe(tick.lastOpportunity);
+        expect(decision.due).toHaveLength(1);
+        expect(decision.due[0].lastOpportunity).toBe(tick.lastOpportunity);
       }
+    }
+  });
+});
+
+describe("overlapping schedule windows", () => {
+  it("does not let a before-target window hide a later due window", () => {
+    // 09:45 London on 10 Oct: w0 (09:00-11:00) target 10:52 is before_target,
+    // but w1 (09:00-10:00) target 09:53 is on its last in-window tick.
+    const decision = decideSchedulerTick(
+      new Date("2026-10-10T08:45:00.000Z"),
+      "09:00-11:00,09:00-10:00",
+    );
+    expect(decision.action).toBe("due");
+    if (decision.action === "due") {
+      expect(decision.due).toHaveLength(1);
+      expect(decision.due[0].window.index).toBe(1);
+      expect(decision.due[0].lastOpportunity).toBe(true);
+    }
+  });
+
+  it("returns every matching window when several are due on one tick", () => {
+    // Identical windows: targets 09:02 (w0) and 09:03 (w1) on 13 Aug, so the
+    // 09:15 London tick is past both.
+    const decision = decideSchedulerTick(
+      new Date("2026-08-13T08:15:00.000Z"),
+      "09:00-11:00,09:00-11:00",
+    );
+    expect(decision.action).toBe("due");
+    if (decision.action === "due") {
+      expect(decision.due.map((d) => d.window.index)).toEqual([0, 1]);
+      expect(decision.due.every((d) => !d.lastOpportunity)).toBe(true);
+    }
+  });
+
+  it("still reports before_target when no window is due yet", () => {
+    const decision = decideSchedulerTick(
+      new Date("2026-10-10T08:30:00.000Z"),
+      "09:00-11:00,09:00-10:00",
+    );
+    expect(decision.action).toBe("before_target");
+    if (decision.action === "before_target") {
+      expect(decision.window.index).toBe(0);
     }
   });
 });
