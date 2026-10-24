@@ -24,7 +24,7 @@ Repository-specific architecture, commands, and exceptions:
 
 This repo does **not** use GitHub milestones.
 
-- **Scope epic:** [#1 Project MVP](https://github.com/xchewtoyx/checkin/issues/1) — the primary requirements record and delivery scope.
+- **Scope epic:** [#1 Project MVP](https://github.com/chewcorp/checkin/issues/1) — the primary requirements record and delivery scope.
 - **Stories and tasks:** file as GitHub **sub-issues** nested under #1 (not as milestone members).
 - When starting work, confirm the issue is a sub-issue of #1 before cutting a branch.
 

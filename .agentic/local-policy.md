@@ -34,7 +34,7 @@ This repo does **not** use GitHub milestones.
 
 | Role | Issue |
 |------|-------|
-| Scope epic / "milestone" | [#1 Project MVP](https://github.com/xchewtoyx/checkin/issues/1) |
+| Scope epic / "milestone" | [#1 Project MVP](https://github.com/chewcorp/checkin/issues/1) |
 | Stories, tasks, bugs | Sub-issues of #1 |
 
 When filing new work:
