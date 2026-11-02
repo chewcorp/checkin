@@ -85,7 +85,16 @@ for SLOT in 030000 150000; do
 done
 ```
 
-Export failures are also logged server-side as `analytics_extract_failed`.
+Export failures are also logged server-side as `analytics_extract_failed` and,
+since CCP-648, recorded durably in the bucket at
+`raw/cloudflare/checkins/_status/extraction_date=YYYY-MM-DD/<HHMMSS>-<attempt_id>.json`
+— the marker carries the slot, attempt id, error and timestamp, and survives a
+clean re-run of the same slot. `scripts/verify-analytics-extract.sh` lists a
+slot's markers and flags row-vs-manifest `attempt_id` mismatches (a partial
+re-run at unchanged row counts); the listing uses `CLOUDFLARE_API_TOKEN` +
+`CLOUDFLARE_ACCOUNT_ID` against the R2 objects API, so the token needs R2
+object-read — a wrong-scope token fails loudly, unset variables skip the
+listing only.
 
 ## Live validation gate
 

@@ -217,8 +217,9 @@ export class AnalyticsExtractError extends Error {
     message: string,
     readonly slot: ExportSlot,
     readonly attemptId: string,
+    options?: { cause?: unknown },
   ) {
-    super(message);
+    super(message, options);
     this.name = "AnalyticsExtractError";
   }
 }
@@ -437,6 +438,7 @@ export async function runAnalyticsExtract(
       error instanceof Error ? error.message : "unknown",
       slot,
       attemptId,
+      { cause: error },
     );
   }
 }

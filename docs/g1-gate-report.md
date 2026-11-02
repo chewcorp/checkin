@@ -274,7 +274,9 @@ bash scripts/verify-analytics-extract.sh raw/cloudflare/checkins/manifests/extra
 It lists the slot's `_status/` markers (when `CLOUDFLARE_API_TOKEN` and
 `CLOUDFLARE_ACCOUNT_ID` are set) and fails on any attempt-id mismatch between
 rows and manifest — which is the re-run-at-unchanged-row-counts case the
-count check above cannot see.
+count check above cannot see. The token must carry R2 object-read on the
+bucket: a wrong-scope token fails the run loudly (the listing cannot masquerade
+as "no markers"), while unset variables take the documented skip path.
 
 ## Verdict
 

@@ -82,7 +82,9 @@ set -euo pipefail
 #
 # The _status/ marker listing uses the same two variables against the R2 HTTP
 # API (GET .../r2/buckets/<bucket>/objects?prefix=...) and runs whenever they
-# are set, with or without --d1.
+# are set, with or without --d1. The token therefore also needs read access to
+# the R2 bucket — a D1-only token lists nothing and fails the run, loudly,
+# rather than silently reporting no markers.
 
 MANIFEST_KEY="${1:?Usage: verify-analytics-extract.sh <manifest-object-key> [--d1]}"
 shift || true
@@ -147,8 +149,13 @@ RESPONSE_KEY=$(jq -r '.tables.checkin_response.object_key' "$TMP/manifest.json")
 # renders non-strings identically to strings, so the classification happens
 # before the value reaches bash. "absent" is legal only below version 3;
 # a declared version promises the field.
+# The version-3-or-later question is decided in jq for the same reason as the
+# version itself: bash `[ ... -ge 3 ]` on a huge declared version can overflow
+# and skip the check silently. "absent_strict" means missing on a version that
+# promised it; "absent" means a pre-3 artifact, which legitimately lacks it.
 ATTEMPT_INFO=$(jq -r '
-  if (has("attempt_id") | not) then "absent"
+  if (has("attempt_id") | not) then
+    (if ((.manifest_version // 1) >= 3) then "absent_strict" else "absent" end)
   elif (.attempt_id | type) != "string" then "invalid " + (.attempt_id | type)
   elif (.attempt_id | length) == 0 then "invalid empty"
   else "present " + .attempt_id
@@ -296,16 +303,15 @@ check_table_attempts() {
   done < <(jq -r 'select(.attempt_id != null) | .attempt_id' "$jsonl_file" | sort -u)
 }
 
-if [ "$ATTEMPT_CLASS" = "absent" ]; then
-  if [ "$MANIFEST_VERSION_CLASS" = "strict" ] && [ "$MANIFEST_VERSION" -ge 3 ]; then
-    report_fail "manifest declares manifest_version ${MANIFEST_VERSION} but has no attempt_id"
-  else
-    echo "no attempt_id in manifest (manifest_version ${MANIFEST_VERSION}) — attempt-id check skipped"
-  fi
-else
-  check_table_attempts checkin_prompt "$TMP/prompt.jsonl"
-  check_table_attempts checkin_response "$TMP/response.jsonl"
-fi
+case "$ATTEMPT_CLASS" in
+  absent_strict)
+    report_fail "manifest declares manifest_version ${MANIFEST_VERSION} but has no attempt_id" ;;
+  absent)
+    echo "no attempt_id in manifest (manifest_version ${MANIFEST_VERSION}) — attempt-id check skipped" ;;
+  *)
+    check_table_attempts checkin_prompt "$TMP/prompt.jsonl"
+    check_table_attempts checkin_response "$TMP/response.jsonl" ;;
+esac
 
 d1_api() {
   local path="$1"
@@ -457,6 +463,11 @@ if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; th
       break
     fi
     STATUS_CURSOR=$(printf '%s' "$STATUS_PAGE" | jq -r '.result_info.cursor // empty')
+    # A truncated page with no cursor would re-fetch the same page forever.
+    if [ -z "$STATUS_CURSOR" ]; then
+      echo "R2 object listing truncated but returned no cursor" >&2
+      exit 1
+    fi
   done
   if [ "$STATUS_FOUND" = "0" ]; then
     echo "no _status/ markers for this slot"
