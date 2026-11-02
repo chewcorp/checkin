@@ -180,6 +180,18 @@ export function validateExtractAttemptIds(
     return { ok: true, errors, skipped: true };
   }
 
+  // A present-but-invalid stamp must fail even with zero rows to disagree
+  // with it — an empty export cannot expose a broken manifest otherwise.
+  if (typeof manifest.attempt_id !== "string" || manifest.attempt_id.length === 0) {
+    return {
+      ok: false,
+      errors: [
+        `manifest attempt_id is not a non-empty string: ${JSON.stringify(manifest.attempt_id)}`,
+      ],
+      skipped: false,
+    };
+  }
+
   for (const table of ["checkin_prompt", "checkin_response"] as const) {
     const ids = attemptIds[table];
     const missing = ids.filter((id) => id === undefined).length;

@@ -314,7 +314,10 @@ export async function runAnalyticsExtractGuarded(env: Env, now: Date): Promise<v
           error.slot,
           error.attemptId,
           error.message,
-          now,
+          // Failure time, not the scheduled tick — the extract can run for
+          // minutes before throwing, and the marker's timestamp is what a
+          // reader checks against surrounding evidence.
+          new Date(),
         );
       } catch (markerError) {
         log("error", "analytics_extract_marker_write_failed", {
