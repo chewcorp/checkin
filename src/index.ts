@@ -5,7 +5,11 @@ import {
   renderManualCheckinPage,
   renderRecordedPage,
 } from "./checkin-page";
-import { runAnalyticsExtract } from "./analytics-extract";
+import {
+  AnalyticsExtractError,
+  runAnalyticsExtract,
+  writeExtractFailureMarker,
+} from "./analytics-extract";
 import {
   authorizeExport,
   authorizeReport,
@@ -287,12 +291,42 @@ export default {
       });
     }
 
-    try {
-      await runAnalyticsExtract(env, now);
-    } catch (error) {
-      log("error", "analytics_extract_failed", {
-        error: error instanceof Error ? error.message : "unknown",
-      });
-    }
+    await runAnalyticsExtractGuarded(env, now);
   },
 };
+
+/**
+ * The extract runs inside its own try/catch so a failure can never take down
+ * the rest of the scheduled handler (N1). On failure the catch first writes a
+ * durable `_status/` marker to the extract bucket — evidence readable with the
+ * same credentials that operate the extract, unlike the log line — then logs
+ * `analytics_extract_failed`. A marker write that itself fails is logged and
+ * swallowed like every other failure in this path.
+ */
+export async function runAnalyticsExtractGuarded(env: Env, now: Date): Promise<void> {
+  try {
+    await runAnalyticsExtract(env, now);
+  } catch (error) {
+    if (env.EXTRACT_BUCKET && error instanceof AnalyticsExtractError) {
+      try {
+        await writeExtractFailureMarker(
+          env.EXTRACT_BUCKET,
+          error.slot,
+          error.attemptId,
+          error.message,
+          now,
+        );
+      } catch (markerError) {
+        log("error", "analytics_extract_marker_write_failed", {
+          error: markerError instanceof Error ? markerError.message : "unknown",
+        });
+      }
+    }
+    log("error", "analytics_extract_failed", {
+      error: error instanceof Error ? error.message : "unknown",
+      ...(error instanceof AnalyticsExtractError
+        ? { attempt_id: error.attemptId }
+        : {}),
+    });
+  }
+}

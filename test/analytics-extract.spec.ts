@@ -4,15 +4,23 @@ import {
   AnalyticsExtractEnv,
   EXPORT_MANIFEST_VERSION,
   buildExportSlot,
+  buildExtractStatusMarkerKey,
   buildManifestObjectKey,
   buildTableObjectKey,
   countJsonlLines,
   executeAnalyticsExtract,
   gunzipText,
+  gzipText,
   runAnalyticsExtract,
   shouldRunExport,
 } from "../src/analytics-extract";
+import {
+  parseExportManifest,
+  validateExtractAttemptIds,
+  validateManifestTieBack,
+} from "../src/analytics-extract-verify";
 import { WHEEL_ERA } from "../src/feelings-wheel";
+import { runAnalyticsExtractGuarded } from "../src/index";
 import { NoopNotifier } from "../src/notifier";
 import { runScheduler } from "../src/scheduler";
 
@@ -46,6 +54,23 @@ class MemoryR2Bucket {
       .filter((key) => key.startsWith(prefix))
       .map((key) => ({ key }));
     return { objects };
+  }
+}
+
+/**
+ * MemoryR2Bucket with a fail switch on `put`, so a test can kill one object
+ * write — e.g. the manifest — while leaving the rest of the bucket live.
+ */
+class FailingR2Bucket extends MemoryR2Bucket {
+  constructor(private readonly failOn: (key: string) => boolean) {
+    super();
+  }
+
+  override async put(key: string, value: ArrayBuffer | string): Promise<void> {
+    if (this.failOn(key)) {
+      throw new Error(`injected put failure: ${key}`);
+    }
+    await super.put(key, value);
   }
 }
 
@@ -549,6 +574,168 @@ describe("analytics extract snapshot", () => {
       new Date("2026-08-15T12:00:00.000Z"),
     );
     expect(result).toEqual({ skipped: true, reason: "outside_export_window" });
+  });
+});
+
+describe("analytics extract attempt id and _status marker", () => {
+  const NOW = new Date("2026-08-15T15:05:00.000Z");
+  const slot = () => buildExportSlot(NOW, 15, 0);
+
+  const readJson = async (bucket: MemoryR2Bucket, key: string) =>
+    JSON.parse(
+      new TextDecoder().decode(await (await bucket.get(key))!.arrayBuffer()),
+    );
+
+  const readJsonlRows = async (bucket: MemoryR2Bucket, key: string) =>
+    (await gunzipText(await (await bucket.get(key))!.arrayBuffer()))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+
+  it("stamps one attempt id on every row and the manifest", async () => {
+    const bucket = new MemoryR2Bucket();
+    await env.DB.prepare("DELETE FROM checkin_response").run();
+    await env.DB.prepare("DELETE FROM checkin_prompt").run();
+    await seedPromptAndResponse();
+
+    const manifest = await executeAnalyticsExtract(
+      createExtractEnv(bucket as unknown as R2Bucket),
+      slot(),
+      NOW,
+    );
+
+    expect(manifest.manifest_version).toBe(3);
+    expect(manifest.attempt_id).toMatch(/^\d{6}-[0-9a-f]{8}$/);
+
+    for (const key of [
+      manifest.tables.checkin_prompt.object_key,
+      manifest.tables.checkin_response.object_key,
+    ]) {
+      const rows = await readJsonlRows(bucket, key);
+      expect(rows).toHaveLength(1);
+      expect(rows.every((row) => row.attempt_id === manifest.attempt_id)).toBe(true);
+    }
+  });
+
+  it("keeps attempt A's _status marker readable after attempt B reruns clean", async () => {
+    // Attempt A dies at the manifest write — both table objects are already in
+    // the bucket, the exact partial state the marker has to describe.
+    let failManifest = true;
+    const bucket = new FailingR2Bucket(
+      (key) => failManifest && key.includes("/manifests/"),
+    );
+    const extractEnv = { ...env, EXTRACT_BUCKET: bucket as unknown as R2Bucket };
+    const s = slot();
+
+    await env.DB.prepare("DELETE FROM checkin_response").run();
+    await env.DB.prepare("DELETE FROM checkin_prompt").run();
+    await seedPromptAndResponse();
+
+    await runAnalyticsExtractGuarded(extractEnv, NOW);
+    failManifest = false;
+    await runAnalyticsExtractGuarded(extractEnv, NOW);
+
+    const markers = await bucket.list({
+      prefix: `raw/cloudflare/checkins/_status/extraction_date=${s.extractionDate}/`,
+    });
+    expect(markers.objects).toHaveLength(1);
+
+    const marker = await readJson(bucket, markers.objects[0].key);
+    expect(marker.attempt_id).toMatch(/^\d{6}-[0-9a-f]{8}$/);
+    expect(marker.extraction_date).toBe(s.extractionDate);
+    expect(marker.object_timestamp).toBe(s.objectTimestamp);
+    expect(marker.error).toContain("injected put failure");
+    expect(markers.objects[0].key).toBe(
+      buildExtractStatusMarkerKey(s, marker.attempt_id),
+    );
+
+    const manifest = parseExportManifest(
+      new TextDecoder().decode(
+        await (await bucket.get(buildManifestObjectKey(s)))!.arrayBuffer(),
+      ),
+    );
+    expect(manifest.attempt_id).toBeDefined();
+    expect(manifest.attempt_id).not.toBe(marker.attempt_id);
+  });
+
+  it("flags a partial rerun whose counts are unchanged", async () => {
+    const bucket = new MemoryR2Bucket();
+    await env.DB.prepare("DELETE FROM checkin_response").run();
+    await env.DB.prepare("DELETE FROM checkin_prompt").run();
+    await seedPromptAndResponse();
+
+    const s = slot();
+    const manifest = await executeAnalyticsExtract(
+      createExtractEnv(bucket as unknown as R2Bucket),
+      s,
+      NOW,
+      "attempt-A",
+    );
+
+    // A rerun overwrites the prompt object and dies before response and
+    // manifest: rows stamp the new attempt, the manifest still certifies the
+    // old one — at identical row counts, which the count check cannot see.
+    const promptKey = manifest.tables.checkin_prompt.object_key;
+    const promptRows = await readJsonlRows(bucket, promptKey);
+    await bucket.put(
+      promptKey,
+      await gzipText(
+        promptRows
+          .map((row) => JSON.stringify({ ...row, attempt_id: "attempt-B" }))
+          .join("\n") + "\n",
+      ),
+    );
+
+    const attemptCheck = validateExtractAttemptIds(manifest, {
+      checkin_prompt: (await readJsonlRows(bucket, promptKey)).map(
+        (row) => row.attempt_id as string | undefined,
+      ),
+      checkin_response: (
+        await readJsonlRows(bucket, manifest.tables.checkin_response.object_key)
+      ).map((row) => row.attempt_id as string | undefined),
+    });
+    expect(attemptCheck.ok).toBe(false);
+    expect(attemptCheck.errors.join(" ")).toContain("attempt-B");
+    expect(attemptCheck.errors.join(" ")).toContain("attempt-A");
+
+    // And the count tie-back still passes — proof this check sees what it cannot.
+    const responseRows = await readJsonlRows(
+      bucket,
+      manifest.tables.checkin_response.object_key,
+    );
+    const tieBack = validateManifestTieBack(
+      manifest,
+      promptRows.length,
+      responseRows.length,
+    );
+    expect(tieBack.ok).toBe(true);
+  });
+
+  it("does not throw out of the guarded call even when the marker write fails too", async () => {
+    // Every write fails: extract fails, the marker write fails as well, and
+    // the guarded path still resolves — the scheduled handler stays up.
+    const bucket = new FailingR2Bucket(() => true);
+    const extractEnv = { ...env, EXTRACT_BUCKET: bucket as unknown as R2Bucket };
+
+    const logged: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    };
+    try {
+      await expect(
+        runAnalyticsExtractGuarded(extractEnv, NOW),
+      ).resolves.toBeUndefined();
+    } finally {
+      console.log = originalLog;
+    }
+
+    expect(
+      logged.some((line) => line.includes("analytics_extract_marker_write_failed")),
+    ).toBe(true);
+    expect(logged.some((line) => line.includes("analytics_extract_failed"))).toBe(
+      true,
+    );
   });
 });
 
