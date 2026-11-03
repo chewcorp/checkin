@@ -123,6 +123,95 @@ export function parseExportManifest(raw: string): ExportManifest {
   return JSON.parse(raw) as ExportManifest;
 }
 
+export interface AttemptIdCheckResult {
+  ok: boolean;
+  errors: string[];
+  /**
+   * True when the manifest predates attempt ids (manifest_version < 3):
+   * there is nothing to check the row stamps against.
+   */
+  skipped: boolean;
+}
+
+/**
+ * Attempt-id consistency check (option B, CCP-648). Every object an extract
+ * attempt writes — each exported row and the manifest — carries the same
+ * `attempt_id`, so a rerun that overwrites a table object but dies before the
+ * response and manifest leaves rows naming an attempt the manifest does not
+ * certify. That makes a partial rerun detectable from the bucket alone, at
+ * unchanged row counts — the case the three-way count check cannot see.
+ *
+ * `attemptIds` is the `.attempt_id` of each row in each table's JSONL object
+ * (undefined for an unstamped row). An empty object carries no stamp and so
+ * cannot contradict the manifest.
+ */
+export function validateExtractAttemptIds(
+  manifest: ExportManifest,
+  attemptIds: {
+    checkin_prompt: (string | undefined)[];
+    checkin_response: (string | undefined)[];
+  },
+): AttemptIdCheckResult {
+  const errors: string[] = [];
+
+  const version = resolveManifestVersion(manifest);
+  if (version === null) {
+    return {
+      ok: false,
+      errors: [
+        `unsupported manifest_version: ${JSON.stringify(manifest.manifest_version)}`,
+      ],
+      skipped: false,
+    };
+  }
+
+  if (manifest.attempt_id === undefined) {
+    // Declaring version 3 or later is the promise that the attempt stamp is
+    // present; a missing field there is a broken artifact, not a legacy one.
+    if (version >= 3) {
+      return {
+        ok: false,
+        errors: [
+          `manifest declares manifest_version ${version} but has no attempt_id`,
+        ],
+        skipped: false,
+      };
+    }
+    return { ok: true, errors, skipped: true };
+  }
+
+  // A present-but-invalid stamp must fail even with zero rows to disagree
+  // with it — an empty export cannot expose a broken manifest otherwise.
+  if (typeof manifest.attempt_id !== "string" || manifest.attempt_id.length === 0) {
+    return {
+      ok: false,
+      errors: [
+        `manifest attempt_id is not a non-empty string: ${JSON.stringify(manifest.attempt_id)}`,
+      ],
+      skipped: false,
+    };
+  }
+
+  for (const table of ["checkin_prompt", "checkin_response"] as const) {
+    const ids = attemptIds[table];
+    const missing = ids.filter((id) => id === undefined).length;
+    if (missing > 0) {
+      errors.push(
+        `${table}: ${missing} row(s) without attempt_id (manifest certifies ${manifest.attempt_id})`,
+      );
+    }
+    for (const id of new Set(ids.filter((id): id is string => id !== undefined))) {
+      if (id !== manifest.attempt_id) {
+        errors.push(
+          `${table} attempt_id mismatch: object carries ${id}, manifest certifies ${manifest.attempt_id}`,
+        );
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors, skipped: false };
+}
+
 /** Expected import prefixes for the analytics platform S3 source. */
 export const ANALYTICS_IMPORT_PREFIXES = {
   checkin_prompt: "raw/cloudflare/checkins/checkin_prompt/",

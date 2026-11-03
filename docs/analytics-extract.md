@@ -179,6 +179,14 @@ completeness stands in for it. Downstream work is not blocked. Recorded in
 full, with the substitute evidence and its limits, in
 [`docs/g1-gate-report.md`](g1-gate-report.md).
 
+Since then (CCP-648) the condition is evaluable directly: a failed attempt
+writes a durable marker to
+`raw/cloudflare/checkins/_status/extraction_date=YYYY-MM-DD/<HHMMSS>-<attempt_id>.json`
+in this bucket, and `scripts/verify-analytics-extract.sh` lists a slot's
+markers and checks row-to-manifest `attempt_id` consistency
+(`manifest_version` 3), so a partial re-run is detectable from the bucket
+alone. See the post-gate section of the gate report.
+
 ## 7. Delivery order
 
 1. **E1 — The extract.** R2 binding + bucket, snapshot writer, manifest, slot gating in the scheduled handler, loop-isolation and idempotency tests. *This slice alone satisfies every F requirement.*

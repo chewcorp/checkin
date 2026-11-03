@@ -242,6 +242,42 @@ it does not prove no failure occurred, it does not cover a manual re-run
 inside the same 15-minute window, and for a re-run it does not even establish
 that the objects under a manifest all came from the same run.
 
+## Post-gate: the failure condition is now evaluable
+
+Since this report was written, CCP-648 closed the evidence gap rather than
+leaving the condition substituted. Every extract run now stamps one
+`attempt_id` onto every exported row and into the manifest
+(`manifest_version` 3), and a failed attempt writes a durable marker into the
+same bucket before the handler logs:
+
+```
+raw/cloudflare/checkins/_status/extraction_date=YYYY-MM-DD/<HHMMSS>-<attempt_id>.json
+```
+
+The marker records the slot, the attempt id, the error, and a timestamp,
+readable with the credentials that already operate the extract — no
+Observability access needed. Zero unexplained `analytics_extract_failed`
+events now means zero `_status/` markers without a recorded explanation,
+which is an object listing, not an argument from absence. And because a
+marker carries its attempt id, a clean re-run in the same slot leaves the
+earlier failure visible rather than overwriting it.
+
+The same change makes the stale-manifest hazard above checkable from the
+bucket: every row names the attempt that wrote it, so a partially overwritten
+slot has table rows naming an attempt the surviving manifest does not
+certify. Both checks run in the existing verifier:
+
+```
+bash scripts/verify-analytics-extract.sh raw/cloudflare/checkins/manifests/extraction_date=YYYY-MM-DD/HHMMSS.json
+```
+
+It lists the slot's `_status/` markers (when `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID` are set) and fails on any attempt-id mismatch between
+rows and manifest — which is the re-run-at-unchanged-row-counts case the
+count check above cannot see. The token must carry R2 object-read on the
+bucket: a wrong-scope token fails the run loudly (the listing cannot masquerade
+as "no markers"), while unset variables take the documented skip path.
+
 ## Verdict
 
 Pre-committed bands: ≥ 75% pass; 50–74% pass-with-friction-review; < 50%

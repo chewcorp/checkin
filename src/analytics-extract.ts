@@ -24,9 +24,10 @@ export interface AnalyticsExtractEnv {
 
 /**
  * Manifest schema version. 1 (implicit, absent field) is every manifest written
- * before the independent source-count check; 2 adds `source_row_count`.
+ * before the independent source-count check; 2 adds `source_row_count`;
+ * 3 adds `attempt_id`.
  */
-export const EXPORT_MANIFEST_VERSION = 2;
+export const EXPORT_MANIFEST_VERSION = 3;
 
 export interface ExportTableManifest {
   /** Rows serialized into the JSONL object. */
@@ -49,6 +50,11 @@ export interface ExportManifest {
   /** Absent in manifest_version 1 artifacts written before the source count. */
   manifest_version?: number;
   extraction_timestamp: string;
+  /**
+   * Id of the single extract attempt that wrote every object this manifest
+   * certifies. Absent in manifest_version < 3 artifacts.
+   */
+  attempt_id?: string;
   /**
    * True when any table's `source_row_count` disagrees with `row_count`.
    * Always present from manifest_version 2. Consumers must check this —
@@ -131,6 +137,93 @@ export function buildManifestObjectKey(slot: ExportSlot): string {
   return `raw/cloudflare/checkins/manifests/extraction_date=${slot.extractionDate}/${slot.objectTimestamp}.json`;
 }
 
+/**
+ * One attempt id per `runAnalyticsExtract` invocation: wall-clock HHMMSS plus
+ * random hex. Stamped into every object the attempt writes (exported rows and
+ * the manifest) and into the `_status/` failure marker key, so a partial rerun
+ * is detectable from the bucket alone (option B, CCP-648).
+ */
+export function newExtractAttemptId(now: Date): string {
+  const random = new Uint8Array(4);
+  crypto.getRandomValues(random);
+  const suffix = [...random]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${formatObjectTimestamp(now)}-${suffix}`;
+}
+
+/**
+ * Failure markers live under `_status/` in the same bucket, partitioned like
+ * every other extract object. The key carries the slot timestamp plus the
+ * attempt id, so a failed attempt's marker survives any number of later
+ * (re)runs in the same slot.
+ */
+export function buildExtractStatusMarkerKey(
+  slot: ExportSlot,
+  attemptId: string,
+): string {
+  return `raw/cloudflare/checkins/_status/extraction_date=${slot.extractionDate}/${slot.objectTimestamp}-${attemptId}.json`;
+}
+
+export interface ExtractFailureMarker {
+  extraction_date: string;
+  object_timestamp: string;
+  attempt_id: string;
+  error: string;
+  timestamp: string;
+}
+
+export function buildExtractFailureMarker(
+  slot: ExportSlot,
+  attemptId: string,
+  error: string,
+  timestamp: Date,
+): ExtractFailureMarker {
+  return {
+    extraction_date: slot.extractionDate,
+    object_timestamp: slot.objectTimestamp,
+    attempt_id: attemptId,
+    error,
+    timestamp: timestamp.toISOString(),
+  };
+}
+
+/**
+ * Durable failure evidence, readable with the same R2 credentials that operate
+ * the extract — no Workers Observability query needed (#61, CCP-648).
+ */
+export async function writeExtractFailureMarker(
+  bucket: R2Bucket,
+  slot: ExportSlot,
+  attemptId: string,
+  errorMessage: string,
+  timestamp: Date,
+): Promise<void> {
+  const marker = buildExtractFailureMarker(slot, attemptId, errorMessage, timestamp);
+  await bucket.put(
+    buildExtractStatusMarkerKey(slot, attemptId),
+    JSON.stringify(marker, null, 2),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
+/**
+ * A failed extract attempt. Carries the slot and attempt id because the thrown
+ * error is the only channel from the extract to the scheduled handler's catch,
+ * which writes the `_status/` marker from them.
+ */
+export class AnalyticsExtractError extends Error {
+  constructor(
+    message: string,
+    readonly slot: ExportSlot,
+    readonly attemptId: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
+    this.name = "AnalyticsExtractError";
+  }
+}
+
 export function serializeJsonl(rows: object[]): string {
   if (rows.length === 0) {
     return "";
@@ -170,6 +263,7 @@ export interface ExportTableCounts {
 export function buildManifest(
   slot: ExportSlot,
   extractionTimestamp: string,
+  attemptId: string,
   prompt: ExportTableCounts,
   response: ExportTableCounts,
 ): ExportManifest {
@@ -178,6 +272,7 @@ export function buildManifest(
   return {
     manifest_version: EXPORT_MANIFEST_VERSION,
     extraction_timestamp: extractionTimestamp,
+    attempt_id: attemptId,
     source_count_mismatch: promptMismatch || responseMismatch,
     tables: {
       checkin_prompt: {
@@ -239,6 +334,7 @@ export async function executeAnalyticsExtract(
   env: AnalyticsExtractEnv,
   slot: ExportSlot,
   now: Date,
+  attemptId: string = newExtractAttemptId(now),
 ): Promise<ExportManifest> {
   if (!env.EXTRACT_BUCKET) {
     throw new Error("extract_bucket_unconfigured");
@@ -272,8 +368,17 @@ export async function executeAnalyticsExtract(
   const responseKey = buildTableObjectKey("checkin_response", slot);
   const manifestKey = buildManifestObjectKey(slot);
 
-  const promptBody = await gzipText(serializeJsonl(prompts));
-  const responseBody = await gzipText(serializeJsonl(responses));
+  // Every exported row carries the attempt id, so the object is stamped the
+  // same way the manifest is — a rerun that overwrites a table object but dies
+  // before the manifest leaves rows naming an attempt the manifest does not.
+  const stampedPrompts = prompts.map((row) => ({ ...row, attempt_id: attemptId }));
+  const stampedResponses = responses.map((row) => ({
+    ...row,
+    attempt_id: attemptId,
+  }));
+
+  const promptBody = await gzipText(serializeJsonl(stampedPrompts));
+  const responseBody = await gzipText(serializeJsonl(stampedResponses));
 
   await env.EXTRACT_BUCKET.put(promptKey, promptBody, {
     httpMetadata: { contentType: "application/gzip" },
@@ -285,6 +390,7 @@ export async function executeAnalyticsExtract(
   const manifest = buildManifest(
     slot,
     extractionTimestamp,
+    attemptId,
     { objectKey: promptKey, rowCount: prompts.length, sourceRowCount: promptSourceCount },
     {
       objectKey: responseKey,
@@ -323,6 +429,16 @@ export async function runAnalyticsExtract(
     return { skipped: true, reason: "outside_export_window" };
   }
 
-  const manifest = await executeAnalyticsExtract(env, slot, now);
-  return { skipped: false, manifest };
+  const attemptId = newExtractAttemptId(now);
+  try {
+    const manifest = await executeAnalyticsExtract(env, slot, now, attemptId);
+    return { skipped: false, manifest };
+  } catch (error) {
+    throw new AnalyticsExtractError(
+      error instanceof Error ? error.message : "unknown",
+      slot,
+      attemptId,
+      { cause: error },
+    );
+  }
 }

@@ -25,6 +25,22 @@ set -euo pipefail
 # such, rather than failing. A manifest that declares version 2 or later and
 # omits the field fails: the version is the promise that the tie-back is there.
 #
+# Attempt-id check (option B, CCP-648): every object an extract attempt writes
+# — each exported row and the manifest — carries the same attempt_id, so a
+# rerun that overwrites a table object but dies before the response and
+# manifest leaves rows naming an attempt the manifest does not certify. That
+# is the partial rerun the count check cannot see at unchanged row counts.
+# manifest_version 3 promises the field; earlier artifacts skip this check.
+#
+# _status/ listing (same ruling): a failed attempt leaves a durable marker at
+# raw/cloudflare/checkins/_status/extraction_date=YYYY-MM-DD/<HHMMSS>-<attempt>.json.
+# This script lists the slot's markers so a gate evaluator can count
+# unexplained failures without Workers Observability. Listing uses the
+# Cloudflare HTTP API — the wrangler CLI has no object-listing command — and
+# reuses the --d1 credentials; without them the listing is skipped with a
+# note. A marker carrying the manifest's own attempt id is an anomaly: the
+# attempt that produced this manifest cannot also have failed.
+#
 # Usage:
 #   bash scripts/verify-analytics-extract.sh <manifest-object-key> [--d1]
 #
@@ -63,6 +79,12 @@ set -euo pipefail
 # cannot resolve the production database from a working copy. Set
 # D1_DATABASE_ID to skip the name lookup; D1_DATABASE (default: checkin) names
 # the database otherwise.
+#
+# The _status/ marker listing uses the same two variables against the R2 HTTP
+# API (GET .../r2/buckets/<bucket>/objects?prefix=...) and runs whenever they
+# are set, with or without --d1. The token therefore also needs read access to
+# the R2 bucket — a D1-only token lists nothing and fails the run, loudly,
+# rather than silently reporting no markers.
 
 MANIFEST_KEY="${1:?Usage: verify-analytics-extract.sh <manifest-object-key> [--d1]}"
 shift || true
@@ -122,6 +144,28 @@ if [ "$MANIFEST_VERSION_CLASS" = "invalid" ]; then
 fi
 PROMPT_KEY=$(jq -r '.tables.checkin_prompt.object_key' "$TMP/manifest.json")
 RESPONSE_KEY=$(jq -r '.tables.checkin_response.object_key' "$TMP/manifest.json")
+
+# attempt_id gets the same jq discipline as the version and counts: jq -r
+# renders non-strings identically to strings, so the classification happens
+# before the value reaches bash. "absent" is legal only below version 3;
+# a declared version promises the field.
+# The version-3-or-later question is decided in jq for the same reason as the
+# version itself: bash `[ ... -ge 3 ]` on a huge declared version can overflow
+# and skip the check silently. "absent_strict" means missing on a version that
+# promised it; "absent" means a pre-3 artifact, which legitimately lacks it.
+ATTEMPT_INFO=$(jq -r '
+  if (has("attempt_id") | not) then
+    (if ((.manifest_version // 1) >= 3) then "absent_strict" else "absent" end)
+  elif (.attempt_id | type) != "string" then "invalid " + (.attempt_id | type)
+  elif (.attempt_id | length) == 0 then "invalid empty"
+  else "present " + .attempt_id
+  end' "$TMP/manifest.json")
+ATTEMPT_CLASS="${ATTEMPT_INFO%% *}"
+MANIFEST_ATTEMPT="${ATTEMPT_INFO#* }"
+if [ "$ATTEMPT_CLASS" = "invalid" ]; then
+  echo "attempt_id is not a non-empty string: ${MANIFEST_ATTEMPT}" >&2
+  exit 1
+fi
 
 # Counts are validated as JSON before they are read, for the same reason as the
 # version: `jq -r` renders the string "1" identically to the number 1, so a
@@ -243,6 +287,32 @@ check_table() {
 check_table checkin_prompt "$EXPECTED_PROMPT" "$PROMPT_LINES" "$SOURCE_PROMPT"
 check_table checkin_response "$EXPECTED_RESPONSE" "$RESPONSE_LINES" "$SOURCE_RESPONSE"
 
+# Attempt-id comparison. Rows without the field and rows carrying a different
+# id than the manifest both fail; an empty object carries no stamp and cannot
+# contradict the manifest.
+check_table_attempts() {
+  local table="$1" jsonl_file="$2" id missing
+  missing=$(jq -c 'select(.attempt_id == null)' "$jsonl_file" | wc -l)
+  if [ "$missing" -gt 0 ]; then
+    report_fail "${table}: ${missing} row(s) without attempt_id (manifest certifies ${MANIFEST_ATTEMPT})"
+  fi
+  while IFS= read -r id; do
+    if [ "$id" != "$MANIFEST_ATTEMPT" ]; then
+      report_fail "${table} attempt_id mismatch: object carries ${id}, manifest certifies ${MANIFEST_ATTEMPT}"
+    fi
+  done < <(jq -r 'select(.attempt_id != null) | .attempt_id' "$jsonl_file" | sort -u)
+}
+
+case "$ATTEMPT_CLASS" in
+  absent_strict)
+    report_fail "manifest declares manifest_version ${MANIFEST_VERSION} but has no attempt_id" ;;
+  absent)
+    echo "no attempt_id in manifest (manifest_version ${MANIFEST_VERSION}) — attempt-id check skipped" ;;
+  *)
+    check_table_attempts checkin_prompt "$TMP/prompt.jsonl"
+    check_table_attempts checkin_response "$TMP/response.jsonl" ;;
+esac
+
 d1_api() {
   local path="$1"
   shift
@@ -346,6 +416,64 @@ if [ "$CHECK_D1" = "1" ]; then
 
   check_d1_table checkin_prompt "$D1_PROMPT" "$EXPECTED_PROMPT" "$PROMPT_LINES" "$SOURCE_PROMPT"
   check_d1_table checkin_response "$D1_RESPONSE" "$EXPECTED_RESPONSE" "$RESPONSE_LINES" "$SOURCE_RESPONSE"
+fi
+
+# _status/ marker listing for this slot. The manifest key carries the slot
+# (extraction_date + HHMMSS); markers for it share the prefix
+# _status/extraction_date=<date>/<HHMMSS>-<attempt>.json. Marker presence is
+# reported, not failed — the gate counts *unexplained* failures, which is a
+# human read of the markers. A marker naming the manifest's own attempt fails,
+# though: the attempt that wrote this manifest cannot also have failed.
+SLOT_DATE=$(printf '%s' "$MANIFEST_KEY" | sed -n 's|.*extraction_date=\([0-9-]\{10\}\)/.*|\1|p')
+SLOT_TIME=$(printf '%s' "$MANIFEST_KEY" | sed -n 's|.*/\([0-9]\{6\}\)\.json$|\1|p')
+
+if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+  if [ -z "$SLOT_DATE" ] || [ -z "$SLOT_TIME" ]; then
+    echo "could not parse slot from manifest key: ${MANIFEST_KEY}" >&2
+    exit 1
+  fi
+  STATUS_PREFIX="raw/cloudflare/checkins/_status/extraction_date=${SLOT_DATE}/${SLOT_TIME}-"
+  STATUS_CURSOR=""
+  STATUS_FOUND=0
+  while : ; do
+    QUERY="prefix=${STATUS_PREFIX}"
+    if [ -n "$STATUS_CURSOR" ]; then
+      QUERY="${QUERY}&cursor=${STATUS_CURSOR}"
+    fi
+    STATUS_PAGE=$(curl -sS -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+      "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${BUCKET}/objects?${QUERY}")
+    # An API error must fail loudly: silently reporting "no markers" would
+    # recreate exactly the unevaluable-evidence gap this check exists to close.
+    if [ "$(printf '%s' "$STATUS_PAGE" | jq -r '.success // false')" != "true" ]; then
+      echo "R2 object listing failed for ${STATUS_PREFIX}: $(printf '%s' "$STATUS_PAGE" | jq -c '.errors // .')" >&2
+      exit 1
+    fi
+    while IFS= read -r key; do
+      [ -z "$key" ] && continue
+      STATUS_FOUND=$((STATUS_FOUND + 1))
+      key_attempt="${key#"${STATUS_PREFIX}"}"
+      key_attempt="${key_attempt%.json}"
+      if [ "$ATTEMPT_CLASS" = "present" ] && [ "$key_attempt" = "$MANIFEST_ATTEMPT" ]; then
+        report_fail "_status marker ${key} carries this manifest's own attempt id"
+      else
+        echo "_status marker: ${key}"
+      fi
+    done < <(printf '%s' "$STATUS_PAGE" | jq -r '.result[]?.key // empty')
+    if [ "$(printf '%s' "$STATUS_PAGE" | jq -r '.result_info.is_truncated // false')" != "true" ]; then
+      break
+    fi
+    STATUS_CURSOR=$(printf '%s' "$STATUS_PAGE" | jq -r '.result_info.cursor // empty')
+    # A truncated page with no cursor would re-fetch the same page forever.
+    if [ -z "$STATUS_CURSOR" ]; then
+      echo "R2 object listing truncated but returned no cursor" >&2
+      exit 1
+    fi
+  done
+  if [ "$STATUS_FOUND" = "0" ]; then
+    echo "no _status/ markers for this slot"
+  fi
+else
+  echo "_status/ marker listing skipped (set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to enable)"
 fi
 
 if [ "$FAILED" != "0" ]; then
