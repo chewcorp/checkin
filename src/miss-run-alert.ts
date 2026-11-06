@@ -2,7 +2,12 @@ import { noticeForTransition } from "./answer-rate-alert";
 import { MISS_RUN_ALERT_ID, MISS_RUN_THRESHOLD } from "./config";
 import { log } from "./logger";
 import { Notifier } from "./notifier";
-import { getAlertState, listRecentClosedPrompts, upsertAlertState } from "./store";
+import {
+  closedPromptOutcome,
+  getAlertState,
+  listRecentClosedPrompts,
+  upsertAlertState,
+} from "./store";
 
 export async function runMissRunAlert(
   env: { DB: D1Database },
@@ -11,9 +16,13 @@ export async function runMissRunAlert(
 ): Promise<void> {
   const nowIso = now.toISOString();
   const prompts = await listRecentClosedPrompts(env.DB, nowIso, MISS_RUN_THRESHOLD);
-  const answered = prompts.filter((prompt) => prompt.status === "answered").length;
+  const closed = prompts.flatMap((prompt) => {
+    const outcome = closedPromptOutcome(prompt.status, prompt.expires_at, nowIso);
+    return outcome === null ? [] : [{ prompt, outcome }];
+  });
+  const answered = closed.filter(({ outcome }) => outcome === "answered").length;
   const status = answered > 0 ? "ok"
-    : prompts.length >= MISS_RUN_THRESHOLD ? "breach" : "unevaluable";
+    : closed.length >= MISS_RUN_THRESHOLD ? "breach" : "unevaluable";
   const previous = await getAlertState(env.DB, MISS_RUN_ALERT_ID);
   let notifiedStatus = previous?.notified_status ?? null;
   const notice = noticeForTransition(notifiedStatus, status);
@@ -22,7 +31,7 @@ export async function runMissRunAlert(
     alert_id: MISS_RUN_ALERT_ID,
     status,
     answered,
-    closed: prompts.length,
+    closed: closed.length,
   });
 
   if (notice) {
@@ -53,9 +62,9 @@ export async function runMissRunAlert(
     notified_status: notifiedStatus,
     evaluated_at: nowIso,
     answered,
-    sent: prompts.length,
+    sent: closed.length,
     rate: null,
-    window_from: prompts.at(-1)?.id.slice(7, 17) ?? nowIso.slice(0, 10),
-    window_to: prompts[0]?.id.slice(7, 17) ?? nowIso.slice(0, 10),
+    window_from: closed.at(-1)?.prompt.id.slice(7, 17) ?? nowIso.slice(0, 10),
+    window_to: closed[0]?.prompt.id.slice(7, 17) ?? nowIso.slice(0, 10),
   });
 }

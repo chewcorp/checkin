@@ -1,9 +1,16 @@
 import { env } from "cloudflare:test";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MISS_RUN_ALERT_ID, MISS_RUN_THRESHOLD } from "../src/config";
 import { runMissRunAlert } from "../src/miss-run-alert";
 import { NoopNotifier } from "../src/notifier";
-import { getAlertState, insertPrompt, PromptStatus } from "../src/store";
+import * as store from "../src/store";
+import {
+  closedPromptOutcome,
+  getAlertState,
+  insertPrompt,
+  listRecentClosedPrompts,
+  PromptStatus,
+} from "../src/store";
 
 describe("runMissRunAlert", () => {
   const now = new Date("2026-11-06T12:00:00.000Z");
@@ -22,7 +29,15 @@ describe("runMissRunAlert", () => {
     await env.DB.prepare("DELETE FROM checkin_prompt").run();
   });
 
-  async function seed(day: number, status: PromptStatus, expiresAt = "2026-11-06T11:00:00.000Z") {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  async function seed(
+    day: number,
+    status: PromptStatus,
+    expiresAt: string | null = "2026-11-06T11:00:00.000Z",
+  ) {
     const date = `2026-10-${String(day).padStart(2, "0")}`;
     const id = `prompt-${date}-w0`;
     await insertPrompt(env.DB, {
@@ -42,6 +57,61 @@ describe("runMissRunAlert", () => {
     await seed(2, "declined");
     await seed(3, "expired");
   }
+
+  it("keeps the SQL prefilter aligned with the shared closed-prompt classification", async () => {
+    const statuses: Record<PromptStatus, PromptStatus> = {
+      scheduled: "scheduled",
+      sent: "sent",
+      answered: "answered",
+      declined: "declined",
+      expired: "expired",
+      failed: "failed",
+    };
+    const expiries = [
+      null,
+      "2026-11-06T11:00:00.000Z",
+      "2026-11-06T13:00:00.000Z",
+    ];
+    const fixtures: { id: string; status: PromptStatus; expires_at: string | null }[] = [];
+    let day = 1;
+
+    for (const status of Object.values(statuses)) {
+      for (const expiresAt of expiries) {
+        await seed(day, status, expiresAt);
+        fixtures.push({
+          id: `prompt-2026-10-${String(day).padStart(2, "0")}-w0`,
+          status,
+          expires_at: expiresAt,
+        });
+        day += 1;
+      }
+    }
+
+    const nowIso = now.toISOString();
+    const included = new Set(
+      (await listRecentClosedPrompts(env.DB, nowIso, fixtures.length)).map((prompt) => prompt.id),
+    );
+    for (const fixture of fixtures) {
+      expect(included.has(fixture.id)).toBe(
+        closedPromptOutcome(fixture.status, fixture.expires_at, nowIso) !== null,
+      );
+    }
+  });
+
+  it("ignores query rows that the shared classification considers open", async () => {
+    vi.spyOn(store, "listRecentClosedPrompts").mockResolvedValue([
+      {
+        id: "prompt-2026-10-01-w0",
+        status: "sent",
+        expires_at: "2026-11-06T13:00:00.000Z",
+      },
+    ]);
+
+    await runMissRunAlert(env, notifier, now);
+
+    expect(sendAlert).not.toHaveBeenCalled();
+    expect((await getAlertState(env.DB, MISS_RUN_ALERT_ID))?.sent).toBe(0);
+  });
 
   it("notifies once for three misses, not again for a fourth, then recovers once and rearms", async () => {
     expect(MISS_RUN_THRESHOLD).toBe(3);
