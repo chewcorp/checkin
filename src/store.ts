@@ -370,6 +370,27 @@ export async function listPromptsInIdRange(
 
 export type AlertNotifiedStatus = "ok" | "breach";
 
+/** Latest closed delivered prompts, newest first; open and failed sends are skipped. */
+export async function listRecentClosedPrompts(
+  db: D1Database,
+  nowIso: string,
+  limit: number,
+): Promise<PromptStatusRow[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, status, expires_at FROM checkin_prompt
+       WHERE scheduled_for <= ? AND (
+         status IN ('answered', 'declined', 'expired')
+         OR (status = 'sent' AND expires_at < ?)
+       )
+       ORDER BY scheduled_for DESC, id DESC
+       LIMIT ?`,
+    )
+    .bind(nowIso, nowIso, limit)
+    .all<PromptStatusRow>();
+  return result.results ?? [];
+}
+
 export interface AlertStateRow {
   id: string;
   notified_status: AlertNotifiedStatus | null;

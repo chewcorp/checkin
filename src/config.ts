@@ -25,6 +25,9 @@ export const ANSWER_RATE_MIN_SENT_PROMPTS = 14;
 
 export const ANSWER_RATE_ALERT_ID = "answer_rate_g1";
 
+export const MISS_RUN_ALERT_ID = "miss_run_3";
+export const MISS_RUN_THRESHOLD = 3;
+
 /**
  * Manual catch-up entries may set `observed_at` on or after the start of
  * this many London calendar days before today, and never in the future.
