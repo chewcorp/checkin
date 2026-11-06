@@ -20,6 +20,7 @@ import {
 import { loadHealthFacts } from "./health-facts";
 import { assessHealth, renderHealthStrip } from "./health-strip";
 import { log } from "./logger";
+import { runMissRunAlert } from "./miss-run-alert";
 import { NoopNotifier, Notifier, PushoverNotifier } from "./notifier";
 import { recordDecline, recordManualResponse, recordResponse } from "./record-response";
 import { runScheduler, SchedulerEnv } from "./scheduler";
@@ -287,6 +288,14 @@ export default {
       await runAnswerRateAlert(env, notifier, now);
     } catch (error) {
       log("error", "answer_rate_alert_failed", {
+        error: error instanceof Error ? error.message : "unknown",
+      });
+    }
+
+    try {
+      await runMissRunAlert(env, notifier, now);
+    } catch (error) {
+      log("error", "miss_run_alert_failed", {
         error: error instanceof Error ? error.message : "unknown",
       });
     }

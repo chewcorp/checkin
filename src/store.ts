@@ -9,6 +9,7 @@ export type PromptStatus =
 /** Closed delivered outcomes. Overdue `sent` counts as expired. */
 export type ClosedPromptOutcome = "answered" | "declined" | "expired";
 
+/** Keep aligned with listRecentClosedPrompts' SQL prefilter. */
 export function closedPromptOutcome(
   status: PromptStatus,
   expiresAt: string | null,
@@ -369,6 +370,28 @@ export async function listPromptsInIdRange(
 }
 
 export type AlertNotifiedStatus = "ok" | "breach";
+
+/** Latest closed delivered prompts, newest first; open and failed sends are skipped. */
+export async function listRecentClosedPrompts(
+  db: D1Database,
+  nowIso: string,
+  limit: number,
+): Promise<PromptStatusRow[]> {
+  const result = await db
+    .prepare(
+      // Keep this prefilter in sync with closedPromptOutcome; the parity test checks it.
+      `SELECT id, status, expires_at FROM checkin_prompt
+       WHERE scheduled_for <= ? AND (
+         status IN ('answered', 'declined', 'expired')
+         OR (status = 'sent' AND expires_at < ?)
+       )
+       ORDER BY scheduled_for DESC, id DESC
+       LIMIT ?`,
+    )
+    .bind(nowIso, nowIso, limit)
+    .all<PromptStatusRow>();
+  return result.results ?? [];
+}
 
 export interface AlertStateRow {
   id: string;
