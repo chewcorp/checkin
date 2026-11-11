@@ -1,6 +1,7 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { REPORT_AUTH_CHALLENGE } from "../src/export";
+import { addCivilDays, trailingLondonWindow } from "../src/health-strip";
 import { getLondonParts } from "../src/london-time";
 
 function requiredBinding(value: string | undefined, name: string): string {
@@ -228,13 +229,27 @@ describe("GET /api/sli", () => {
   });
 
   it("counts an in-window failed prompt with a null sent_at and drops the others", async () => {
-    const londonDate = getLondonParts(new Date()).dateKey;
+    const window = trailingLondonWindow(new Date());
     await insertPrompt({
-      id: `prompt-${londonDate}-w1`,
+      id: `prompt-${window.end}-w1`,
       status: "failed",
       sentAt: null,
       expiresAt: null,
       token: "failed-in-window",
+    });
+    await insertPrompt({
+      id: `prompt-${window.start}-w0`,
+      status: "failed",
+      sentAt: null,
+      expiresAt: null,
+      token: "failed-on-start",
+    });
+    await insertPrompt({
+      id: `prompt-${addCivilDays(window.end, 1)}-w0`,
+      status: "failed",
+      sentAt: null,
+      expiresAt: null,
+      token: "failed-after-window",
     });
     await insertPrompt({
       id: "prompt-2020-01-01-w1",
@@ -250,6 +265,13 @@ describe("GET /api/sli", () => {
       expiresAt: null,
       token: "failed-unparsed",
     });
+    await insertPrompt({
+      id: `prompt-${window.end}-extra`,
+      status: "failed",
+      sentAt: null,
+      expiresAt: null,
+      token: "failed-unparsed-in-range",
+    });
 
     const response = await SELF.fetch("https://example.com/api/sli", {
       headers: sliHeaders(),
@@ -261,7 +283,7 @@ describe("GET /api/sli", () => {
       };
     };
     expect(body.coverage.answer).toEqual({ kind: "absent", reason: "no-sends" });
-    expect(body.coverage.failed).toBe(1);
+    expect(body.coverage.failed).toBe(2);
 
     const report = await SELF.fetch("https://example.com/report", {
       headers: exportHeaders(),

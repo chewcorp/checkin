@@ -5,6 +5,7 @@ import {
   ExtractReading,
   HealthStrip,
   LondonDateWindow,
+  addCivilDays,
   assessHealth,
   parsePromptDateKey,
 } from "./health-strip";
@@ -77,7 +78,11 @@ async function countFailedInWindow(
   window: LondonDateWindow,
 ): Promise<number> {
   const result = await db
-    .prepare(`SELECT id FROM checkin_prompt WHERE status = 'failed'`)
+    .prepare(
+      `SELECT id FROM checkin_prompt
+       WHERE status = 'failed' AND id >= ? AND id < ?`,
+    )
+    .bind(`prompt-${window.start}`, `prompt-${addCivilDays(window.end, 1)}`)
     .all<{ id: string }>();
   let count = 0;
   for (const row of result.results ?? []) {
