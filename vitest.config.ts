@@ -9,6 +9,7 @@ export default defineWorkersConfig({
         miniflare: {
           bindings: {
             EXPORT_BEARER_TOKEN: "test-export-token",
+            SLI_BEARER_TOKEN: "test-sli-token",
           },
         },
       },
