@@ -314,6 +314,38 @@ describe("GET /api/sli", () => {
     expect(reportLists).toBeGreaterThan(0);
   });
 
+  it("reports unreadable when recent manifest reads fail", async () => {
+    await clearManifests();
+    const bucket = env.EXTRACT_BUCKET;
+    if (!bucket) {
+      throw new Error("EXTRACT_BUCKET binding missing");
+    }
+    const original = bucket.get.bind(bucket);
+    bucket.get = (async () => {
+      throw new Error("r2 unavailable");
+    }) as typeof bucket.get;
+    try {
+      const lists = await countBucketLists(async () => {
+        const response = await SELF.fetch("https://example.com/api/sli", {
+          headers: sliHeaders(),
+        });
+        expect(response.status).toBe(200);
+        const body = (await response.json()) as {
+          coverage: { answer: { kind: string } };
+          recency: string | null;
+          extract: { kind: string; reason?: string };
+        };
+        expect(body.coverage.answer.kind).toBe("absent");
+        expect(body.recency).toBeNull();
+        expect(body.extract.kind).toBe("unreadable");
+        expect(body.extract.reason).toBeUndefined();
+      });
+      expect(lists).toBe(0);
+    } finally {
+      bucket.get = original;
+    }
+  });
+
   it("omits feeling text, notes, and prompt ids from the body", async () => {
     const feeling = "zircon-glimmer-feeling";
     const note = "quartz-margin-sentinel";

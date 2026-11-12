@@ -101,7 +101,11 @@ async function countFailedInWindow(
 }
 
 function recentManifestMissing(extract: ExtractFacts): boolean {
-  return extract.kind === "bucket" && extract.manifests.length === 0;
+  return (
+    extract.kind === "bucket" &&
+    extract.manifests.length === 0 &&
+    extract.unreadableKeys.length === 0
+  );
 }
 
 function sliBody(
