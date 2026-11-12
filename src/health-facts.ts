@@ -189,6 +189,7 @@ async function* manifestKeysNewestFirst(
 async function loadExtract(
   bucket: R2Bucket | undefined,
   now: Date,
+  walk: boolean,
 ): Promise<ExtractFacts> {
   if (!bucket) {
     return { kind: "no-bucket" };
@@ -235,7 +236,7 @@ async function loadExtract(
       }
       manifests.push(head);
     }
-    if (manifests.length === 0) {
+    if (walk && manifests.length === 0) {
       const attempted = new Set(reads.map(({ key }) => key));
       let readsDone = 0;
       for await (const key of manifestKeysNewestFirst(bucket, now)) {
@@ -285,10 +286,12 @@ async function loadExtract(
 export async function loadHealthFacts(
   env: HealthFactsEnv,
   now: Date,
+  options?: { walk?: boolean },
 ): Promise<HealthFacts> {
+  const walk = options?.walk !== false;
   const [delivered, extract] = await Promise.all([
     loadDelivered(env.DB),
-    loadExtract(env.EXTRACT_BUCKET, now),
+    loadExtract(env.EXTRACT_BUCKET, now, walk),
   ]);
   return {
     observedAt: now.toISOString(),

@@ -19,6 +19,7 @@ import {
 } from "./export";
 import { loadHealthFacts } from "./health-facts";
 import { assessHealth, renderHealthStrip } from "./health-strip";
+import { handleSli } from "./sli";
 import { log } from "./logger";
 import { runMissRunAlert } from "./miss-run-alert";
 import { NoopNotifier, Notifier, PushoverNotifier } from "./notifier";
@@ -31,6 +32,7 @@ export interface Env extends SchedulerEnv {
   PUSHOVER_TOKEN?: string;
   PUSHOVER_USER?: string;
   EXPORT_BEARER_TOKEN?: string;
+  SLI_BEARER_TOKEN?: string;
   EXTRACT_BUCKET?: R2Bucket;
 }
 
@@ -252,6 +254,14 @@ export default {
 
     if (url.pathname === "/api/responses") {
       return handleExportResponses(request, env);
+    }
+
+    if (url.pathname === "/api/sli") {
+      return handleSli(request, {
+        DB: env.DB,
+        EXTRACT_BUCKET: env.EXTRACT_BUCKET,
+        SLI_BEARER_TOKEN: env.SLI_BEARER_TOKEN,
+      });
     }
 
     if (url.pathname === "/report") {

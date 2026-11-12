@@ -58,8 +58,9 @@ jobs:
           PUSHOVER_TOKEN: ${{ secrets.PUSHOVER_TOKEN }}
           PUSHOVER_USER: ${{ secrets.PUSHOVER_USER }}
           EXPORT_BEARER_TOKEN: ${{ secrets.EXPORT_BEARER_TOKEN }}
+          SLI_BEARER_TOKEN: ${{ secrets.SLI_BEARER_TOKEN }}
         run: |
-          for secret in PUSHOVER_TOKEN PUSHOVER_USER EXPORT_BEARER_TOKEN; do
+          for secret in PUSHOVER_TOKEN PUSHOVER_USER EXPORT_BEARER_TOKEN SLI_BEARER_TOKEN; do
             if [ -z "${!secret}" ]; then
               echo "$secret GitHub secret is required" >&2
               exit 1
@@ -84,3 +85,9 @@ jobs:
           BASE_URL: ${{ vars.BASE_URL }}
           EXPORT_BEARER_TOKEN: ${{ secrets.EXPORT_BEARER_TOKEN }}
         run: bash scripts/smoke-report.sh
+      - name: Smoke test /api/sli
+        env:
+          BASE_URL: ${{ vars.BASE_URL }}
+          SLI_BEARER_TOKEN: ${{ secrets.SLI_BEARER_TOKEN }}
+          EXPORT_BEARER_TOKEN: ${{ secrets.EXPORT_BEARER_TOKEN }}
+        run: bash scripts/smoke-sli.sh

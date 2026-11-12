@@ -47,7 +47,19 @@ openssl rand -hex 32
 
 Store as GitHub secret `EXPORT_BEARER_TOKEN`.
 
-### 5. Cloudflare API token
+### 5. SLI bearer token
+
+Generate a second value for `GET /api/sli`:
+
+```bash
+openssl rand -hex 32
+```
+
+Store it as GitHub secret `SLI_BEARER_TOKEN`.
+
+`EXPORT_BEARER_TOKEN` does not open `/api/sli`. `SLI_BEARER_TOKEN` does not open `/api/responses`, `/report`, or `/checkin`.
+
+### 6. Cloudflare API token
 
 Create an API token with at least:
 
@@ -58,7 +70,7 @@ Create an API token with at least:
 
 Store as GitHub secret `CLOUDFLARE_API_TOKEN`. Store your account ID as `CLOUDFLARE_ACCOUNT_ID`.
 
-### 6. Production URL
+### 7. Production URL
 
 After the first successful deploy, set GitHub repository variable:
 
@@ -78,7 +90,8 @@ Re-run the deploy workflow (or push to `main`) if the first deploy ran before `B
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account identifier |
 | `PUSHOVER_TOKEN` | Pushover application API token (Worker runtime) |
 | `PUSHOVER_USER` | Pushover user key (Worker runtime) |
-| `EXPORT_BEARER_TOKEN` | Token for `GET /api/responses` (Bearer), `GET /report` (Bearer or Basic password), and `GET/POST /checkin` (Bearer or Basic password) |
+| `EXPORT_BEARER_TOKEN` | Token for `GET /api/responses` (Bearer), `GET /report` (Bearer or Basic password), and `GET/POST /checkin` (Bearer or Basic password). Does not open `GET /api/sli` |
+| `SLI_BEARER_TOKEN` | Bearer token for `GET /api/sli` only. Does not open `/api/responses`, `/report`, or `/checkin` |
 
 ### Variables (Settings → Secrets and variables → Actions → Variables)
 
@@ -96,6 +109,7 @@ Re-run the deploy workflow (or push to `main`) if the first deploy ran before `B
 5. `wrangler deploy --env production` with `BASE_URL` var
 6. Smoke test `GET $BASE_URL/health`
 7. Smoke test `GET $BASE_URL/report` with `EXPORT_BEARER_TOKEN` (Bearer); records window, rate/band or Absent, and extract freshness without logging the token or HTML body
+8. Smoke test `GET $BASE_URL/api/sli` with `SLI_BEARER_TOKEN` (Bearer). Confirm HTTP 200 and `application/json`. An empty 7-day lookback is `extract` kind `error` and reason `manifest_missing`, not Absent. A failed recent read stays `unreadable`. Then confirm `EXPORT_BEARER_TOKEN` receives 401. Do not log the token or the raw body.
 
 ## Manual smoke test (after first deploy)
 
@@ -109,6 +123,11 @@ curl -H "Authorization: Bearer $EXPORT_BEARER_TOKEN" \
 curl -H "Authorization: Bearer $EXPORT_BEARER_TOKEN" \
   "$BASE_URL/report"
 # browser: open /report or /checkin and use any username with EXPORT_BEARER_TOKEN as the password
+
+curl -H "Authorization: Bearer $SLI_BEARER_TOKEN" \
+  "$BASE_URL/api/sli"
+# empty lookback: HTTP 200, extract {"kind":"error","reason":"manifest_missing"}
+# /report still renders Absent and still walks older manifests
 ```
 
 Confirm a Pushover notification arrives and a check-in completes end-to-end on your phone.
