@@ -109,7 +109,7 @@ Re-run the deploy workflow (or push to `main`) if the first deploy ran before `B
 5. `wrangler deploy --env production` with `BASE_URL` var
 6. Smoke test `GET $BASE_URL/health`
 7. Smoke test `GET $BASE_URL/report` with `EXPORT_BEARER_TOKEN` (Bearer); records window, rate/band or Absent, and extract freshness without logging the token or HTML body
-8. Smoke test `GET $BASE_URL/api/sli` with `SLI_BEARER_TOKEN` (Bearer). Confirm `application/json`, then confirm `EXPORT_BEARER_TOKEN` receives 401. Do not log the token or the raw body
+8. Smoke test `GET $BASE_URL/api/sli` with `SLI_BEARER_TOKEN` (Bearer). Confirm HTTP 200 and `application/json`. An empty 7-day lookback is `extract` kind `error` and reason `manifest_missing`, not Absent. A failed recent read stays `unreadable`. Then confirm `EXPORT_BEARER_TOKEN` receives 401. Do not log the token or the raw body.
 
 ## Manual smoke test (after first deploy)
 
@@ -126,6 +126,8 @@ curl -H "Authorization: Bearer $EXPORT_BEARER_TOKEN" \
 
 curl -H "Authorization: Bearer $SLI_BEARER_TOKEN" \
   "$BASE_URL/api/sli"
+# empty lookback: HTTP 200, extract {"kind":"error","reason":"manifest_missing"}
+# /report still renders Absent and still walks older manifests
 ```
 
 Confirm a Pushover notification arrives and a check-in completes end-to-end on your phone.

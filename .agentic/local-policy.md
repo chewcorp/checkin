@@ -8,7 +8,7 @@ This file is **hand-maintained** and referenced from `.agentic/harness.yaml`.
 Cloudflare Worker (TypeScript) with D1 persistence.
 
 - `src/index.ts` — Worker entry (`/health`, `/c/:token`, `/checkin`, `/api/responses`, `/api/sli`, `/report`, scheduled loop)
-- `src/sli.ts` — `GET /api/sli` for bearer `SLI_BEARER_TOKEN`
+- `src/sli.ts` — `GET /api/sli` for bearer `SLI_BEARER_TOKEN`. An empty 7-day lookback is `manifest_missing`, not the strip's absent extract.
 - `src/scheduler.ts` — idempotent Europe/London scheduler
 - `src/weekly-summary.ts` — weekly Pushover mood summary (Sunday 20:00 London)
 - `src/answer-rate-alert.ts` — standing G1 answer-rate drift alert
