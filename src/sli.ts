@@ -29,10 +29,14 @@ export type MeasuredCoverage = {
 
 export type SliCoverage = AbsentCoverage | MeasuredCoverage;
 
+export type SliExtract =
+  | ExtractReading
+  | { readonly kind: "error"; readonly reason: "manifest_missing" };
+
 export type SliBody = {
   readonly coverage: SliCoverage;
   readonly recency: string | null;
-  readonly extract: ExtractReading;
+  readonly extract: SliExtract;
 };
 
 export type SliSource = HealthFactsEnv & {
@@ -97,7 +101,7 @@ async function countFailedInWindow(
 }
 
 function recentManifestMissing(extract: ExtractFacts): boolean {
-  return extract.kind === "no-bucket" || extract.manifests.length === 0;
+  return extract.kind === "bucket" && extract.manifests.length === 0;
 }
 
 function sliBody(
@@ -144,12 +148,13 @@ export async function handleSli(
     ),
     latestSubmittedAt(source.DB),
   ]);
-  if (recentManifestMissing(facts.extract)) {
-    return new Response("Extract manifest missing", { status: 503 });
-  }
   const strip = assessHealth(facts);
   const failedCount = await countFailedInWindow(source.DB, strip.window);
-  return new Response(JSON.stringify(sliBody(strip, failedCount, recency)), {
+  const document = sliBody(strip, failedCount, recency);
+  const body = recentManifestMissing(facts.extract)
+    ? { ...document, extract: { kind: "error" as const, reason: "manifest_missing" as const } }
+    : document;
+  return new Response(JSON.stringify(body), {
     headers: SLI_JSON_HEADERS,
   });
 }

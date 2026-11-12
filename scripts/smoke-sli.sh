@@ -87,7 +87,7 @@ print("token_in_body=no")
 errors: list[str] = []
 if answer_kind not in {"absent", "measured"}:
     errors.append("answer kind missing")
-if extract_kind not in {"absent", "unreadable", "landed"}:
+if extract_kind not in {"absent", "unreadable", "landed", "error"}:
     errors.append("extract kind missing")
 if day_count != 14:
     errors.append("window day count must be 14")

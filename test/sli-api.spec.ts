@@ -118,6 +118,25 @@ async function putRecentManifest(): Promise<void> {
   await putManifest(slot);
 }
 
+async function countBucketLists(run: () => Promise<void>): Promise<number> {
+  const bucket = env.EXTRACT_BUCKET;
+  if (!bucket) {
+    throw new Error("EXTRACT_BUCKET binding missing");
+  }
+  let lists = 0;
+  const original = bucket.list.bind(bucket);
+  bucket.list = ((...args: Parameters<R2Bucket["list"]>) => {
+    lists += 1;
+    return original(...args);
+  }) as typeof bucket.list;
+  try {
+    await run();
+    return lists;
+  } finally {
+    bucket.list = original;
+  }
+}
+
 async function clearManifests(): Promise<void> {
   const bucket = env.EXTRACT_BUCKET;
   if (!bucket) {
@@ -214,17 +233,36 @@ describe("GET /api/sli", () => {
     expect(() => JSON.parse(text)).toThrow();
   });
 
-  it("returns an error when the lookback has no readable manifest", async () => {
+  it("returns manifest_missing and does not list R2 when the lookback is empty", async () => {
     await clearManifests();
-    const response = await SELF.fetch("https://example.com/api/sli", {
-      headers: sliHeaders(),
+    const lists = await countBucketLists(async () => {
+      const response = await SELF.fetch("https://example.com/api/sli", {
+        headers: sliHeaders(),
+      });
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      const body = JSON.parse(text) as {
+        coverage: {
+          window: { dayCount: number };
+          answer: { kind: string; reason?: string };
+          failed: number | null;
+        };
+        recency: string | null;
+        extract: { kind: string; reason?: string };
+      };
+      expect(body.coverage.answer).toEqual({ kind: "absent", reason: "no-sends" });
+      expect(body.coverage.failed).toBeNull();
+      expect(body.coverage.window.dayCount).toBe(14);
+      expect(body.recency).toBeNull();
+      expect(body.extract).toEqual({ kind: "error", reason: "manifest_missing" });
+      expect(text).not.toContain('"feeling"');
+      expect(text).not.toContain('"note"');
+      expect(text).not.toContain('"prompt_id"');
+      const numbers: number[] = [];
+      collectNumbers(body, numbers);
+      expect(numbers.every((value) => value !== 0)).toBe(true);
     });
-    expect(response.status).toBe(503);
-    const text = await response.text();
-    expect(text).toBe("Extract manifest missing");
-    expect(text).not.toContain('"feeling"');
-    expect(text).not.toContain('"note"');
-    expect(text).not.toContain('"prompt_id"');
+    expect(lists).toBe(0);
   });
 
   it("reports an empty prompt table with no numeric zero", async () => {
@@ -255,18 +293,25 @@ describe("GET /api/sli", () => {
     const past = new Date(Date.now() - 40 * 86_400_000);
     await putManifest(buildExportSlot(past, 3, 0));
 
-    const sli = await SELF.fetch("https://example.com/api/sli", {
-      headers: sliHeaders(),
+    const lists = await countBucketLists(async () => {
+      const sli = await SELF.fetch("https://example.com/api/sli", {
+        headers: sliHeaders(),
+      });
+      expect(sli.status).toBe(200);
+      const body = (await sli.json()) as { extract: { kind: string; reason?: string } };
+      expect(body.extract).toEqual({ kind: "error", reason: "manifest_missing" });
     });
-    expect(sli.status).toBe(503);
-    expect(await sli.text()).toBe("Extract manifest missing");
+    expect(lists).toBe(0);
 
-    const report = await SELF.fetch("https://example.com/report", {
-      headers: exportHeaders(),
+    const reportLists = await countBucketLists(async () => {
+      const report = await SELF.fetch("https://example.com/report", {
+        headers: exportHeaders(),
+      });
+      const html = await report.text();
+      expect(report.status).toBe(200);
+      expect(html).toContain('data-extract="landed"');
     });
-    const html = await report.text();
-    expect(report.status).toBe(200);
-    expect(html).toContain('data-extract="landed"');
+    expect(reportLists).toBeGreaterThan(0);
   });
 
   it("omits feeling text, notes, and prompt ids from the body", async () => {
