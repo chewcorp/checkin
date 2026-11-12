@@ -2,6 +2,7 @@ import { parseBearerToken } from "./export";
 import { HealthFactsEnv, loadHealthFacts } from "./health-facts";
 import {
   AnswerReading,
+  ExtractFacts,
   ExtractReading,
   HealthStrip,
   LondonDateWindow,
@@ -95,6 +96,10 @@ async function countFailedInWindow(
   return count;
 }
 
+function recentManifestMissing(extract: ExtractFacts): boolean {
+  return extract.kind === "no-bucket" || extract.manifests.length === 0;
+}
+
 function sliBody(
   strip: HealthStrip,
   failedCount: number,
@@ -135,9 +140,13 @@ export async function handleSli(
     loadHealthFacts(
       { DB: source.DB, EXTRACT_BUCKET: source.EXTRACT_BUCKET },
       now,
+      { walk: false },
     ),
     latestSubmittedAt(source.DB),
   ]);
+  if (recentManifestMissing(facts.extract)) {
+    return new Response("Extract manifest missing", { status: 503 });
+  }
   const strip = assessHealth(facts);
   const failedCount = await countFailedInWindow(source.DB, strip.window);
   return new Response(JSON.stringify(sliBody(strip, failedCount, recency)), {

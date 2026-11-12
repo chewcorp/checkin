@@ -1,7 +1,17 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import {
+  buildExportSlot,
+  buildManifestObjectKey,
+  type ExportSlot,
+} from "../src/analytics-extract";
 import { REPORT_AUTH_CHALLENGE } from "../src/export";
-import { addCivilDays, trailingLondonWindow } from "../src/health-strip";
+import {
+  FRESHNESS_LOOKBACK_DAYS,
+  addCivilDays,
+  recentExportSlots,
+  trailingLondonWindow,
+} from "../src/health-strip";
 import { getLondonParts } from "../src/london-time";
 
 function requiredBinding(value: string | undefined, name: string): string {
@@ -74,6 +84,40 @@ async function insertResponse(params: {
     .run();
 }
 
+function manifestBody(slot: ExportSlot): string {
+  const tableEntry = (table: string) => ({
+    row_count: 1,
+    source_row_count: 1,
+    object_key: `raw/cloudflare/checkins/${table}/extraction_date=${slot.extractionDate}/${slot.objectTimestamp}.jsonl.gz`,
+    source_count_mismatch: false,
+  });
+  return JSON.stringify({
+    manifest_version: 2,
+    extraction_timestamp: new Date(slot.scheduledAt.getTime() + 3 * 60_000).toISOString(),
+    source_count_mismatch: false,
+    tables: {
+      checkin_prompt: tableEntry("checkin_prompt"),
+      checkin_response: tableEntry("checkin_response"),
+    },
+  });
+}
+
+async function putManifest(slot: ExportSlot): Promise<void> {
+  const bucket = env.EXTRACT_BUCKET;
+  if (!bucket) {
+    throw new Error("EXTRACT_BUCKET binding missing");
+  }
+  await bucket.put(buildManifestObjectKey(slot), manifestBody(slot));
+}
+
+async function putRecentManifest(): Promise<void> {
+  const slot = recentExportSlots(new Date(), FRESHNESS_LOOKBACK_DAYS)[0];
+  if (!slot) {
+    throw new Error("no recent export slot");
+  }
+  await putManifest(slot);
+}
+
 async function clearManifests(): Promise<void> {
   const bucket = env.EXTRACT_BUCKET;
   if (!bucket) {
@@ -108,6 +152,7 @@ describe("GET /api/sli", () => {
     await env.DB.prepare("DELETE FROM checkin_response").run();
     await env.DB.prepare("DELETE FROM checkin_prompt").run();
     await clearManifests();
+    await putRecentManifest();
   });
 
   it("lets the SLI bearer read /api/sli and refuses it on export, report, and check-in", async () => {
@@ -169,29 +214,59 @@ describe("GET /api/sli", () => {
     expect(() => JSON.parse(text)).toThrow();
   });
 
-  it("reports an empty database with no numeric zero", async () => {
+  it("returns an error when the lookback has no readable manifest", async () => {
+    await clearManifests();
+    const response = await SELF.fetch("https://example.com/api/sli", {
+      headers: sliHeaders(),
+    });
+    expect(response.status).toBe(503);
+    const text = await response.text();
+    expect(text).toBe("Extract manifest missing");
+    expect(text).not.toContain('"feeling"');
+    expect(text).not.toContain('"note"');
+    expect(text).not.toContain('"prompt_id"');
+  });
+
+  it("reports an empty prompt table with no numeric zero", async () => {
     const response = await SELF.fetch("https://example.com/api/sli", {
       headers: sliHeaders(),
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as {
       coverage: {
-        window: { start: string; end: string; dayCount: number };
+        window: { dayCount: number };
         answer: { kind: string; reason?: string };
         failed: number | null;
       };
       recency: string | null;
-      extract: { kind: string; reason?: string };
     };
     expect(body.coverage.answer).toEqual({ kind: "absent", reason: "no-sends" });
     expect(body.coverage.failed).toBeNull();
     expect(body.recency).toBeNull();
-    expect(body.extract).toEqual({ kind: "absent", reason: "no-manifest" });
     expect(body.coverage.window.dayCount).toBe(14);
     const numbers: number[] = [];
     collectNumbers(body, numbers);
     expect(numbers).toContain(14);
     expect(numbers.every((value) => value !== 0)).toBe(true);
+  });
+
+  it("does not search older manifests, while /report still does", async () => {
+    await clearManifests();
+    const past = new Date(Date.now() - 40 * 86_400_000);
+    await putManifest(buildExportSlot(past, 3, 0));
+
+    const sli = await SELF.fetch("https://example.com/api/sli", {
+      headers: sliHeaders(),
+    });
+    expect(sli.status).toBe(503);
+    expect(await sli.text()).toBe("Extract manifest missing");
+
+    const report = await SELF.fetch("https://example.com/report", {
+      headers: exportHeaders(),
+    });
+    const html = await report.text();
+    expect(report.status).toBe(200);
+    expect(html).toContain('data-extract="landed"');
   });
 
   it("omits feeling text, notes, and prompt ids from the body", async () => {
